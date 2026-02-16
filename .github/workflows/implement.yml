@@ -1,0 +1,149 @@
+name: Implement Approved Plan
+
+on:
+  issues:
+    types: [labeled]
+  repository_dispatch:
+    types: [implement]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  implement:
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'ready to implement') ||
+      github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine issue source
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "number=${{ github.event.client_payload.issue_number }}" >> "$GITHUB_OUTPUT"
+            echo "repo=${{ github.event.client_payload.issues_repo }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            echo "repo=${{ github.repository }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract implementation plan from issue
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUES_REPO: ${{ steps.issue.outputs.repo }}
+        run: |
+          BODY=$(gh issue view "$ISSUE_NUMBER" --repo "$ISSUES_REPO" --json body --jq '.body')
+          # Extract the Implementation Plan section
+          PLAN=$(echo "$BODY" | sed -n '/## Implementation Plan/,/<!-- slack_coordinates/p' | head -n -1)
+          echo "plan<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$PLAN" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post run link to issue and Slack
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUES_REPO: ${{ steps.issue.outputs.repo }}
+          WEBHOOK_URL: ${{ secrets.CLACK_WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.CLACK_WEBHOOK_TOKEN }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Comment on the issue with the workflow run link
+          gh issue comment "$ISSUE_NUMBER" --repo "$ISSUES_REPO" \
+            --body "🔧 Implementation started: [View workflow run](${RUN_URL})"
+
+          # Notify the bot via webhook (if configured) so it can post in the Slack thread
+          if [ -n "$WEBHOOK_URL" ] && [ -n "$WEBHOOK_TOKEN" ]; then
+            BODY=$(gh issue view "$ISSUE_NUMBER" --repo "$ISSUES_REPO" --json body --jq '.body')
+            SLACK_COORDS=$(echo "$BODY" | grep -o '<!-- slack_coordinates:.*-->' || true)
+            jq -n \
+              --argjson issue_number "$ISSUE_NUMBER" \
+              --arg run_url "$RUN_URL" \
+              --arg issues_repo "$ISSUES_REPO" \
+              --arg slack_coordinates "$SLACK_COORDS" \
+              '{implementation_started: {issue_number: $issue_number, run_url: $run_url, issues_repo: $issues_repo, slack_coordinates: $slack_coordinates}}' \
+            | curl -sf -X POST "${WEBHOOK_URL}/webhook/${WEBHOOK_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d @- || echo "Webhook notification failed (non-fatal)"
+          fi
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Implement with Claude Code
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUES_REPO: ${{ steps.issue.outputs.repo }}
+          PLAN: ${{ steps.plan.outputs.plan }}
+        run: |
+          ISSUE_URL="https://github.com/${ISSUES_REPO}/issues/${ISSUE_NUMBER}"
+          claude -p --dangerously-skip-permissions "You are implementing an approved plan for issue #${ISSUE_NUMBER}.
+
+          Here is the implementation plan:
+
+          ${PLAN}
+
+          Instructions:
+          1. Read the codebase to understand the existing patterns and conventions.
+          2. Create a feature branch: feat/${ISSUE_NUMBER}-implementation
+          3. Implement the changes described in the plan, following existing code conventions.
+          4. Commit your changes with a descriptive message referencing the issue.
+          5. Push the branch.
+          6. Open a PR with:
+             - Title referencing the issue (e.g. 'feat: implement #${ISSUE_NUMBER}')
+             - Body containing 'Closes ${ISSUE_URL}' and a summary of changes.
+
+          Use gh pr create to open the PR."
+
+      - name: Create PR if Claude Code didn't
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUES_REPO: ${{ steps.issue.outputs.repo }}
+        run: |
+          ISSUE_URL="https://github.com/${ISSUES_REPO}/issues/${ISSUE_NUMBER}"
+          # Check if a PR already exists for this branch
+          BRANCH="feat/${ISSUE_NUMBER}-implementation"
+          PR_COUNT=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$PR_COUNT" -eq 0 ]; then
+            # Check if the branch was pushed
+            if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+              echo "Branch exists but no PR — creating one"
+              gh pr create \
+                --head "$BRANCH" \
+                --title "feat: implement #${ISSUE_NUMBER}" \
+                --body "Closes ${ISSUE_URL}
+
+          Automated implementation by Claude Code."
+            else
+              echo "No branch found — Claude Code may not have pushed"
+            fi
+          else
+            echo "PR already exists"
+          fi
+
+      - name: Label issue as ready for review
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUES_REPO: ${{ steps.issue.outputs.repo }}
+        run: |
+          BRANCH="feat/${ISSUE_NUMBER}-implementation"
+          PR_COUNT=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$PR_COUNT" -gt 0 ]; then
+            gh issue edit "$ISSUE_NUMBER" --repo "$ISSUES_REPO" --add-label "Ready for review"
+          else
+            echo "No PR found — skipping review label"
+          fi
